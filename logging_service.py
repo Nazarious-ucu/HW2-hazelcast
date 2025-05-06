@@ -50,3 +50,4 @@ def get_all_messages():
     result = {k: v for k, v in all_entries}
     print(f"[Instance {INSTANCE_ID}] Returning {len(result)} messages")
     return {"messages": result}
+
