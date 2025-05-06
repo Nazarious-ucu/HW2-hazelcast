@@ -1,10 +1,14 @@
-# facade_service.py
 import random
-
+import consul
+import os
+import atexit
 import hazelcast
 import requests
+import uuid
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+consul_client = consul.Consul()
 
 app = FastAPI(
     title="Facade Service API",
@@ -15,47 +19,58 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
-logging_services = [
-    "http://localhost:8001/messages",
-    "http://localhost:8002/messages",
-    "http://localhost:8003/messages",
-]
-messages_services = [
-    "http://localhost:8004/messages",
-    "http://localhost:8005/messages",
-]
+PORT = int(os.getenv("PORT", 8000))
+HOST = os.getenv("HOST", "localhost")
+INSTANCE_ID = os.getenv("INSTANCE_ID", str(uuid.uuid4()))
+service_id = f"facade-service-{INSTANCE_ID}"
+check = consul.Check.http(f"http://{HOST}:{PORT}/health", "10s")
+consul_client.agent.service.register(
+    name="facade-service",
+    service_id=service_id,
+    address=HOST, port=PORT,
+    check=check
+)
 
-
-hz = hazelcast.HazelcastClient()
-queue = hz.get_queue("msg-queue").blocking()
+_, kv = consul_client.kv.get("mq/queue_lab5")
+queue_name = kv["Value"].decode() if kv else "msg-queue"
+hz_client = hazelcast.HazelcastClient()
+queue     = hz_client.get_queue(queue_name).blocking()
 
 class Message(BaseModel):
     message: str
 
+@app.get("/health")
+def health(): return {"status": "UP"}
+
+def discover(service_name: str):
+    _, nodes = consul_client.health.service(service_name, passing=True)
+    return [
+        f"http://{n['Service']['Address']}:{n['Service']['Port']}"
+        for n in nodes
+    ]
+
 @app.post("/messages")
 def post_message(msg: Message):
-    idx = random.randrange(len(logging_services))
-    for i in range(len(logging_services)):
-        url = logging_services[(idx + i) % len(logging_services)]
-        try:
-            r = requests.post(url, json=msg.dict(), timeout=2)
-            if r.status_code == 200:
-                print(f"[Facade] POST ⇒ {url} OK")
-                break
-        except:
-            continue
-    else:
-        raise HTTPException(503, "Logging-service недоступні")
+    addrs = discover("logging-service")
+    if not addrs:
+        raise HTTPException(503, "No logging-service available")
+    url = random.choice(addrs) + "/messages"
+    resp = requests.post(url, json=msg.dict(), timeout=2)
+    if resp.status_code != 200:
+        raise HTTPException(502, "Logging-service error")
+
     queue.put(msg.message)
     print(f"[Facade] Enqueued: {msg.message}")
     return {"status": "queued_and_logged"}
 
 @app.get("/messages")
 def get_messages():
-    idx = random.randrange(len(logging_services))
-    log_msgs = []
-    for i in range(len(logging_services)):
-        url = logging_services[(idx + i) % len(logging_services)]
+    log_addrs = discover("logging-service")
+    idx = random.randrange(len(log_addrs))
+    if not log_addrs:
+        raise HTTPException(503, "No logging-service available")
+    for i in range(len(log_addrs)):
+        url = log_addrs[(idx + i) % len(log_addrs)] + '/messages'
         try:
             r = requests.get(url, timeout=2)
             if r.status_code == 200:
@@ -67,10 +82,13 @@ def get_messages():
     else:
         raise HTTPException(503, "Logging-service недоступні")
 
-    idx = random.randrange(len(messages_services))
+    msg_addrs = discover("messages-service")
+    idx = random.randrange(len(msg_addrs))
+    if not msg_addrs:
+        raise HTTPException(503, "No messages-service available")
     mq_msgs = []
-    for i in range(len(messages_services)):
-        url = messages_services[(idx + i) % len(messages_services)]
+    for i in range(len(msg_addrs)):
+        url = msg_addrs[(idx + i) % len(msg_addrs)] + "/messages"
         try:
             r = requests.get(url, timeout=2)
             if r.status_code == 200:
@@ -83,3 +101,7 @@ def get_messages():
         raise HTTPException(503, "Messages-service недоступні")
 
     return {"messages_from_logging": log_msgs, "messages_from_messaging": mq_msgs}
+
+@atexit.register
+def deregister():
+    consul_client.agent.service.deregister(service_id)

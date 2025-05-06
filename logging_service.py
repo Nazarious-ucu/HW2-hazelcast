@@ -5,35 +5,49 @@ import atexit
 import uuid
 
 import hazelcast
+import consul
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# ─── Запускаємо Hazelcast‑нод через ваш CLI (припустимо, 'hz start' працює) ────
+consul_client = consul.Consul()
+_, kv = consul_client.kv.get("hazelcast/lab5")
+cluster_name = kv["Value"].decode() if kv else "dev"
+
 hz_proc = subprocess.Popen(["hz", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
 def _stop_hz():
-    # просто вбиваємо процес ноди
-    hz_proc.terminate()
-    hz_proc.wait(timeout=5)
-
+    hz_proc.terminate(); hz_proc.wait(5)
 atexit.register(_stop_hz)
-
-# даємо ноді час приєднатись до кластеру
 time.sleep(5)
 
-# ─── Підключаємо клієнта до кластеру та беремо розподілену мапу ───────────────
-client = hazelcast.HazelcastClient()
-messages_map = client.get_map("messages").blocking()
+client = hazelcast.HazelcastClient(cluster_name=cluster_name)
+messages_map = client.get_map("logging-messages").blocking()
 
 app = FastAPI()
-INSTANCE_ID = os.environ.get("INSTANCE_ID", "unknown")
+PORT = int(os.getenv("PORT", 8001))
+HOST = os.getenv("HOST", "localhost")
+
+
+INSTANCE_ID = os.getenv("INSTANCE_ID", str(uuid.uuid4()))
+service_id = f"logging-service-{INSTANCE_ID}"
+
+check = consul.Check.http(f"http://{HOST}:{PORT}/health", "10s")
+consul_client.agent.service.register(
+    name="logging-service",
+    service_id=service_id,
+    address=HOST, port=PORT,
+    check=check
+)
+
 
 class Message(BaseModel):
     message: str
 
+@app.get("/health")
+def health(): return {"status": "UP"}
+
 @app.post("/messages")
 def save_message(msg: Message):
-    # генеруємо унікальний ключ самі
     msg_id = str(uuid.uuid4())
     messages_map.put(msg_id, msg.message)
     print(f"[Instance {INSTANCE_ID}] Saved message {msg_id}: '{msg.message}'")
@@ -45,9 +59,11 @@ def save_message(msg: Message):
 
 @app.get("/messages")
 def get_all_messages():
-    # повертаємо dict id→text
-    all_entries = messages_map.entry_set()  # List of (key, value)
+    all_entries = messages_map.entry_set()
     result = {k: v for k, v in all_entries}
     print(f"[Instance {INSTANCE_ID}] Returning {len(result)} messages")
     return {"messages": result}
 
+@atexit.register
+def deregister():
+    consul_client.agent.service.deregister(service_id)
