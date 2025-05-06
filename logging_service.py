@@ -16,7 +16,8 @@ cluster_name = kv["Value"].decode() if kv else "dev"
 
 hz_proc = subprocess.Popen(["hz", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def _stop_hz():
-    hz_proc.terminate(); hz_proc.wait(5)
+    hz_proc.terminate()
+    hz_proc.wait(5)
 atexit.register(_stop_hz)
 time.sleep(5)
 
@@ -64,6 +65,6 @@ def get_all_messages():
     print(f"[Instance {INSTANCE_ID}] Returning {len(result)} messages")
     return {"messages": result}
 
-@atexit.register
-def deregister():
-    consul_client.agent.service.deregister(service_id)
+# @atexit.register
+# def deregister():
+  #  consul_client.agent.service.deregister(service_id)
